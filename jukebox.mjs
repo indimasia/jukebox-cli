@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Jukebox CLI: shared music queue, terminal only, audio only.
-// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--fallback <youtube playlist url>]
+// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--fallback <youtube playlist url>]
 // Guests scan the QR (web page) or use: jukebox join <host:port> <CODE> <name>
 import http from "node:http";
 import os from "node:os";
@@ -156,7 +156,23 @@ async function host() {
     .listen(port);
 
   const ips = Object.values(os.networkInterfaces()).flat().filter((i) => i.family === "IPv4" && !i.internal).map((i) => i.address);
-  const web = `http://${ips[0] ?? "localhost"}:${port}/?code=${code}`;
+  let base = `http://${ips[0] ?? "localhost"}:${port}`;
+  let tunnel = null;
+  if (rest.includes("--tunnel")) {
+    // Cloudflare quick tunnel: free public https URL, no account. Guests can join from any network.
+    console.log("starting tunnel…");
+    tunnel = spawn("cloudflared", ["tunnel", "--no-autoupdate", "--url", `http://localhost:${port}`], { stdio: ["ignore", "ignore", "pipe"] });
+    base = await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("tunnel did not start within 30s")), 30000);
+      tunnel.on("error", () => rej(new Error("cloudflared not found, install it: https://github.com/cloudflare/cloudflared")));
+      tunnel.stderr.on("data", (d) => {
+        const m = String(d).match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+        if (m) clearTimeout(t), res(m[0]);
+      });
+    }).catch((e) => (console.error(e.message), process.exit(1)));
+    process.on("exit", () => tunnel.kill());
+  }
+  const web = `${base}/?code=${code}`;
   let qr = ["(install qrencode to show a QR code)"];
   try {
     qr = execFileSync("qrencode", ["-t", "UTF8", "-m", "1", web]).toString().split("\n").filter(Boolean);
@@ -278,7 +294,7 @@ async function join() {
   const call = async (path, params = {}) => {
     const qs = new URLSearchParams({ code, user, ...params });
     try {
-      return await (await fetch(`http://${addr}${path}?${qs}`)).text();
+      return await (await fetch(`${/^https?:\/\//.test(addr) ? addr : `http://${addr}`}${path}?${qs}`)).text();
     } catch (e) {
       return `error: ${e.cause?.code ?? e.message}\n`;
     }
@@ -367,4 +383,4 @@ refresh(); setInterval(refresh, 5000);
 
 if (cmd === "host") host();
 else if (cmd === "join") join();
-else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--fallback <playlist url>]\n  jukebox join <host:port> <CODE> [name]");
+else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--fallback <playlist url>]\n  jukebox join <host:port | https://url> <CODE> [name]");

@@ -18,6 +18,7 @@ The script installs only what's missing:
 - qrencode
 - Node.js 18+
 - yt-dlp
+- cloudflared (for `--tunnel`)
 
 On macOS it uses Homebrew. On Linux it uses apt, dnf or pacman, and installs the latest yt-dlp binary to `~/.local/bin`. The `jukebox` command goes in `~/.local/bin`.
 
@@ -25,6 +26,7 @@ On macOS it uses Homebrew. On Linux it uses apt, dnf or pacman, and installs the
 
 ```bash
 jukebox host
+jukebox host --tunnel      # guests can join from anywhere, not just your Wi-Fi
 jukebox host --limit 3 --shuffle --fallback "https://www.youtube.com/playlist?list=..."
 ```
 
@@ -33,6 +35,7 @@ jukebox host --limit 3 --shuffle --fallback "https://www.youtube.com/playlist?li
 | `--port` | `7777` | Web/API port |
 | `--limit` | `2` | Max songs each person can have waiting in the queue |
 | `--shuffle` | off | Pick the next song at random instead of taking turns |
+| `--tunnel` | off | Public HTTPS link via a free Cloudflare quick tunnel (no account), so guests on any network can join |
 | `--fallback` | none | Playlist that plays when the queue is empty |
 
 While hosting, type at the `>` prompt:
@@ -50,7 +53,9 @@ While hosting, type at the `>` prompt:
 - **Phone:** scan the QR code on the host screen. Type a name, search, and pick a song from the results.
 - **Terminal:** `jukebox join <host-ip>:7777 <ROOM CODE> [name]`. Type a song, then pick a number from the results.
 
-Guests must be on the same network as the host. If phones can't connect, allow incoming connections for `node` in the host's firewall.
+Without `--tunnel`, guests must be on the same network as the host. If phones can't connect, allow incoming connections for `node` in the host's firewall, or use `--tunnel`.
+
+With `--tunnel`, terminal guests join with the full link: `jukebox join https://xxxx.trycloudflare.com <ROOM CODE> [name]`. The link is public, so the room code is the only thing keeping strangers out. The link changes every time you start a room.
 
 ## How it works
 

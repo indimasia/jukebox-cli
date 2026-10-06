@@ -13,7 +13,7 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 has() { command -v "$1" >/dev/null 2>&1; }
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
-# 1. System packages, only the missing ones: ffmpeg, qrencode, node (+ yt-dlp on macOS)
+# 1. System packages, only the missing ones: ffmpeg, qrencode, node (+ yt-dlp, cloudflared on macOS)
 missing=()
 has ffmpeg || missing+=(ffmpeg)
 has qrencode || missing+=(qrencode)
@@ -21,6 +21,7 @@ case "$(uname -s)" in
   Darwin)
     has node || missing+=(node)
     has yt-dlp || missing+=(yt-dlp)
+    has cloudflared || missing+=(cloudflared)
     if [ ${#missing[@]} -gt 0 ]; then
       has brew || die "Homebrew is required: https://brew.sh"
       say "Installing ${missing[*]} with Homebrew"
@@ -43,6 +44,19 @@ case "$(uname -s)" in
     say "Installing latest yt-dlp to $BIN_DIR"
     curl -fL --progress-bar https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$BIN_DIR/yt-dlp"
     chmod +x "$BIN_DIR/yt-dlp"
+    # cloudflared powers `jukebox host --tunnel`.
+    if ! has cloudflared; then
+      case "$(uname -m)" in
+        x86_64) CF_ARCH=amd64 ;; aarch64|arm64) CF_ARCH=arm64 ;; armv7l|armv6l) CF_ARCH=arm ;; *) CF_ARCH="" ;;
+      esac
+      if [ -n "$CF_ARCH" ]; then
+        say "Installing cloudflared to $BIN_DIR"
+        curl -fL --progress-bar "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH" -o "$BIN_DIR/cloudflared"
+        chmod +x "$BIN_DIR/cloudflared"
+      else
+        say "Skipping cloudflared (unknown CPU $(uname -m)); --tunnel will not work"
+      fi
+    fi
     ;;
   *) die "unsupported OS: $(uname -s) (macOS and Linux only)" ;;
 esac
