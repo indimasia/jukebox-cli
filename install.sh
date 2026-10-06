@@ -41,9 +41,14 @@ case "$(uname -s)" in
     fi
     # Distro yt-dlp is usually too old for YouTube; use the official binary.
     mkdir -p "$BIN_DIR"
-    say "Installing latest yt-dlp to $BIN_DIR"
-    curl -fL --progress-bar https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$BIN_DIR/yt-dlp"
-    chmod +x "$BIN_DIR/yt-dlp"
+    if [ -x "$BIN_DIR/yt-dlp" ]; then
+      say "Updating yt-dlp"
+      "$BIN_DIR/yt-dlp" -U >/dev/null || true
+    else
+      say "Installing latest yt-dlp to $BIN_DIR"
+      curl -fL --progress-bar https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$BIN_DIR/yt-dlp"
+      chmod +x "$BIN_DIR/yt-dlp"
+    fi
     # cloudflared powers `jukebox host --tunnel`.
     if ! has cloudflared; then
       case "$(uname -m)" in
