@@ -153,6 +153,11 @@ async function host() {
         res.writeHead(400).end(`error: ${e.message}\n`);
       }
     })
+    .on("error", (e) => {
+      process.stdout.write("\x1b[?1049l");
+      console.error(e.code === "EADDRINUSE" ? `port ${port} is in use (another jukebox running?), try --port ${port + 1}` : e.message);
+      process.exit(1);
+    })
     .listen(port);
 
   const ips = Object.values(os.networkInterfaces()).flat().filter((i) => i.family === "IPv4" && !i.internal).map((i) => i.address);
