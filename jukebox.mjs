@@ -67,6 +67,7 @@ async function host() {
   let now = null;
   let startedAt = 0;
   let player = null;
+  let pausedAt = null; // seconds into the song while paused, else null
 
   if (flag("fallback")) fallback = parse(await ytdlp(["--flat-playlist", "--print", "%(id)s\t%(title)s\t%(duration)s", "--", flag("fallback")]), "fallback");
 
@@ -74,7 +75,7 @@ async function host() {
     if (queue.filter((s) => s.user === user).length >= limit) throw new Error(`limit of ${limit} queued songs reached`);
     queue.push({ ...song, user });
     say(`+ ${user} queued ${song.title}`);
-    if (!player) playNext();
+    if (!now) playNext();
     return song;
   };
 
@@ -117,32 +118,75 @@ async function host() {
     }
   };
 
+  const elapsed = () => (pausedAt ?? (Date.now() - startedAt) / 1000);
+
   function playNext() {
-    ring.fill(0);
+    pausedAt = null;
     now = pickNext();
     if (!now) return (player = null);
     lastPlayed[now.user] = Date.now();
-    startedAt = Date.now();
-    // yt-dlp -> ffmpeg decodes to raw PCM at real-time speed -> we tap it for the visualizer -> ffmpeg plays it on the system's default output.
-    const dl = spawn("yt-dlp", ["-q", "-f", "bestaudio", "-o", "-", "--", `https://youtu.be/${now.id}`], { stdio: ["ignore", "pipe", "ignore"] });
-    const dec = spawn("ffmpeg", ["-loglevel", "quiet", "-re", "-i", "-", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"], { stdio: ["pipe", "pipe", "ignore"] });
+    download(now);
+    start(0);
+  }
+
+  // The current song's audio is kept in memory as it downloads, so pause/resume never hits YouTube again.
+  // ponytail: whole song in RAM (~4-10MB per song), only the current one.
+  let song = null; // { chunks, done, dl, sink }
+  function download(s) {
+    song?.dl.kill();
+    const dl = spawn("yt-dlp", ["-q", "-f", "bestaudio", "-o", "-", "--", `https://youtu.be/${s.id}`], { stdio: ["ignore", "pipe", "ignore"] });
+    const cur = (song = { chunks: [], done: false, dl, sink: null });
+    dl.stdout.on("data", (b) => (cur.chunks.push(b), cur.sink?.write(b)));
+    dl.stdout.on("end", () => ((cur.done = true), cur.sink?.end()));
+    dl.on("exit", (code) => code && !cur.chunks.length && say(`! YouTube refused "${s.title}", skipped`));
+  }
+
+  // Pause stops playback and remembers the position; play restarts decoding from memory at that spot (ffmpeg -ss).
+  const pause = () => {
+    if (!now || pausedAt != null) return;
+    pausedAt = elapsed();
+    player.stop();
+    ring.fill(0);
+    say("⏸ paused");
+  };
+  const resume = () => {
+    if (pausedAt == null) return;
+    const at = pausedAt;
+    pausedAt = null;
+    start(at);
+    say("▶ resumed");
+  };
+
+  function start(at) {
+    ring.fill(0);
+    startedAt = Date.now() - at * 1000;
+    // song bytes -> ffmpeg decodes to raw PCM at real-time speed -> we tap it for the visualizer -> ffmpeg plays it on the system's default output.
+    const dec = spawn("ffmpeg", ["-loglevel", "quiet", "-re", ...(at ? ["-ss", String(at)] : []), "-i", "-", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"], { stdio: ["pipe", "pipe", "ignore"] });
     const out = spawn("ffmpeg", ["-loglevel", "quiet", "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "-", ...AUDIO_OUT], { stdio: ["pipe", "ignore", "ignore"] });
-    dl.stdout.pipe(dec.stdin);
+    dec.stdin.on("error", () => {}); // EPIPE on skip/pause
+    out.stdin.on("error", () => {});
+    for (const b of song.chunks) dec.stdin.write(b);
+    if (song.done) dec.stdin.end();
+    else song.sink = dec.stdin;
     dec.stdout.on("data", (buf) => (feed(buf), out.stdin.write(buf)));
     dec.stdout.on("end", () => out.stdin.end());
-    dec.stdin.on("error", () => {}); // EPIPE on skip
-    out.stdin.on("error", () => {});
-    const procs = [dl, dec, out];
-    player = { kill: () => procs.forEach((p) => p.kill()) };
+    let stopped = false;
+    const halt = () => {
+      if (song.sink === dec.stdin) song.sink = null;
+      dec.kill();
+      out.kill();
+    };
+    // kill = skip (moves to next song), stop = pause (stays on this song)
+    player = { kill: halt, stop: () => ((stopped = true), halt()) };
     out.on("exit", () => {
-      procs.forEach((p) => p.kill());
-      playNext();
+      halt();
+      if (!stopped) playNext();
     });
   }
 
   const status = () =>
     [
-      (now ? `▶ ${now.title} [${fmt(now.secs)}] — ${now.user}` : "(nothing playing)") + (shuffle ? "  [shuffle]" : ""),
+      (now ? `${pausedAt != null ? "⏸" : "▶"} ${now.title} [${fmt(now.secs)}] — ${now.user}` : "(nothing playing)") + (shuffle ? "  [shuffle]" : ""),
       ...upcoming().map((s, i) => `${i + 1}. ${s.title} [${fmt(s.secs)}] — ${s.user}`),
     ].join("\n");
 
@@ -162,7 +206,7 @@ async function host() {
         }
         if (url.pathname === "/queue") return res.end(status() + "\n");
         if (url.pathname === "/state")
-          return res.end(JSON.stringify({ now: now && { ...now, elapsed: (Date.now() - startedAt) / 1000 }, queue: upcoming(), shuffle }));
+          return res.end(JSON.stringify({ now: now && { ...now, elapsed: elapsed() }, paused: pausedAt != null, queue: upcoming(), shuffle }));
         res.writeHead(404).end("not found\n");
       } catch (e) {
         res.writeHead(400).end(`error: ${e.message}\n`);
@@ -260,16 +304,16 @@ async function host() {
         ? [...qr, "", "  scan to add songs"]
         : [...viz(Math.floor(LW / 3), H - 2), "", c(245, cut(web, LW))];
     const RW = stacked ? cols : cols - LW - 3;
-    const elapsed = now ? (Date.now() - startedAt) / 1000 : 0;
+    const pos = now ? elapsed() : 0;
     const pw = Math.max(10, RW - 14);
-    const done = now?.secs ? Math.min(pw, Math.round((elapsed / now.secs) * pw)) : 0;
+    const done = now?.secs ? Math.min(pw, Math.round((pos / now.secs) * pw)) : 0;
     const right = [
       bold(c(213, "♫ Jukebox")) + `  room ${bold(code)}` + (shuffle ? c(171, "  ⤨ shuffle") : ""),
       c(245, cut(web, RW)),
       "",
-      now ? bold(cut(`▶ ${now.title}`, RW)) : c(245, "nothing playing — add a song"),
+      now ? bold(cut(`${pausedAt != null ? "⏸" : "▶"} ${now.title}`, RW)) : c(245, "nothing playing — add a song"),
       now ? c(245, cut(`  added by ${now.user}`, RW)) : "",
-      now ? c(171, "━".repeat(done)) + c(238, "━".repeat(pw - done)) + ` ${fmt(elapsed)}/${fmt(now.secs)}` : "",
+      now ? c(171, "━".repeat(done)) + c(238, "━".repeat(pw - done)) + ` ${fmt(pos)}/${fmt(now.secs)}` : "",
       "",
       bold("Up next"),
       ...(queue.length ? upcoming().map((s, i) => cut(`${i + 1}. ${s.title} — ${s.user}`, RW)) : [c(245, fallback.length ? "  (fallback playlist)" : "  (empty)")]),
@@ -279,14 +323,15 @@ async function host() {
     const body = stacked ? [...left, "", ...right] : Array.from({ length: Math.max(left.length, right.length) }, (_, i) => pad(left[i] ?? "", LW) + "   " + (right[i] ?? ""));
     const lines = body.slice(0, rows - 2);
     while (lines.length < rows - 2) lines.push("");
-    lines.push(c(245, cut("<song> add · s skip · r shuffle · v/tab visualizer · t layout · q quit", cols)));
+    lines.push(c(245, cut("<song> add · p/space pause · s skip · r shuffle · v/tab visualizer · t layout · q quit", cols)));
     process.stdout.write("\x1b[H" + lines.map((l) => l + "\x1b[K").join("\r\n") + "\r\n" + cut(`> ${input}`, cols) + "\x1b[K");
   }
 
-  const quit = () => (player?.kill(), process.exit(0));
+  const quit = () => (song?.dl.kill(), player?.kill(), process.exit(0));
   const command = (line) => {
     if (line === "q") quit();
-    else if (line === "s") player?.kill();
+    else if (line === "s") pausedAt != null ? playNext() : player?.kill();
+    else if (line === "p") pausedAt != null ? resume() : pause();
     else if (line === "r") say(`shuffle ${(shuffle = !shuffle) ? "on" : "off"}`);
     else if (line === "v") view = view === "qr" ? "viz" : "qr";
     else if (line === "t") (layout = layout === "side" ? "stack" : "side"), process.stdout.write("\x1b[2J");
@@ -307,6 +352,7 @@ async function host() {
       else if (key?.name === "return") (command(input.trim()), (input = ""));
       else if (key?.name === "backspace") input = input.slice(0, -1);
       else if (key?.name === "tab") view = view === "qr" ? "viz" : "qr";
+      else if (key?.name === "space" && !input) command("p");
       else if (ch && !key?.ctrl && !key?.meta && ch >= " ") input += ch;
       render();
     });
@@ -409,10 +455,10 @@ let state = null, fetchedAt = 0;
 const drawNow = () => {
   const box = $("now");
   if (!state || !state.now) return box.replaceChildren(el("div", "empty", "Nothing playing. Add a song!"));
-  const s = state.now, elapsed = s.elapsed + (Date.now() - fetchedAt) / 1000;
+  const s = state.now, elapsed = s.elapsed + (state.paused ? 0 : (Date.now() - fetchedAt) / 1000);
   box.replaceChildren(card(s, (c, info) => {
     c.classList.add("now");
-    info.prepend(el("div", "badge", "▶ Now playing" + (state.shuffle ? " · shuffle" : "")));
+    info.prepend(el("div", "badge", (state.paused ? "⏸ Paused" : "▶ Now playing") + (state.shuffle ? " · shuffle" : "")));
     const bar = el("div", "bar"), fill = el("i");
     fill.style.width = s.secs ? Math.min(100, elapsed / s.secs * 100) + "%" : "0";
     bar.append(fill); info.append(bar);

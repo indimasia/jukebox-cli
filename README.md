@@ -44,6 +44,7 @@ While hosting, type at the `>` prompt:
 | Input | Action |
 |---|---|
 | song name or YouTube URL | add the top result |
+| `p` or `Space` | pause / play |
 | `s` | skip |
 | `r` | toggle shuffle |
 | `v` or `Tab` | switch between the QR code and the audio visualizer |
