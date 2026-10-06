@@ -36,6 +36,7 @@ jukebox host --limit 3 --shuffle --fallback "https://www.youtube.com/playlist?li
 | `--limit` | `2` | Max songs each person can have waiting in the queue |
 | `--shuffle` | off | Pick the next song at random instead of taking turns |
 | `--tunnel` | off | Public HTTPS link via a free Cloudflare quick tunnel (no account), so guests on any network can join |
+| `--stacked` | off | Start in the top/bottom layout (visualizer or QR on top, queue below) |
 | `--fallback` | none | Playlist that plays when the queue is empty |
 
 While hosting, type at the `>` prompt:
@@ -46,11 +47,12 @@ While hosting, type at the `>` prompt:
 | `s` | skip |
 | `r` | toggle shuffle |
 | `v` or `Tab` | switch between the QR code and the audio visualizer |
+| `t` | switch layout: side by side, or top/bottom |
 | `q` | quit |
 
 ## Join as a guest
 
-- **Phone:** scan the QR code on the host screen. Type a name, search, and pick a song from the results.
+- **Phone:** scan the QR code on the host screen. Type a name, search, and pick a song from the results. The page shows what's playing and the queue as cards, in the order they'll play.
 - **Terminal:** `jukebox join <host-ip>:7777 <ROOM CODE> [name]`. Type a song, then pick a number from the results.
 
 Without `--tunnel`, guests must be on the same network as the host. If phones can't connect, allow incoming connections for `node` in the host's firewall, or use `--tunnel`.

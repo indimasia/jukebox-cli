@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Jukebox CLI: shared music queue, terminal only, audio only.
-// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--fallback <youtube playlist url>]
+// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--fallback <youtube playlist url>]
 // Guests scan the QR (web page) or use: jukebox join <host:port> <CODE> <name>
 import http from "node:http";
 import os from "node:os";
@@ -61,6 +61,7 @@ async function host() {
   const say = (m) => events.push(m) > 6 && events.shift();
   let shuffle = rest.includes("--shuffle");
   let view = "qr"; // or "viz"
+  let layout = rest.includes("--stacked") ? "stack" : "side"; // side-by-side or top/bottom
   let fallback = [];
   let fallbackPos = 0;
   let now = null;
@@ -86,11 +87,23 @@ async function host() {
       return shuffle ? fallback[rand(fallback.length)] : fallback[fallbackPos++ % fallback.length];
     }
     if (shuffle) return queue.splice(rand(queue.length), 1)[0];
-    let best = 0;
-    queue.forEach((s, i) => {
-      if ((lastPlayed[s.user] ?? 0) < (lastPlayed[queue[best].user] ?? 0)) best = i;
-    });
-    return queue.splice(best, 1)[0];
+    return queue.splice(queue.indexOf(upcoming()[0]), 1)[0];
+  };
+  // Queue in the order it will play: simulate fair turns. In shuffle mode the order is unknown, so show as added.
+  const upcoming = () => {
+    if (shuffle) return queue;
+    const q = [...queue], lp = { ...lastPlayed }, out = [];
+    let t = Date.now();
+    while (q.length) {
+      let best = 0;
+      q.forEach((s, i) => {
+        if ((lp[s.user] ?? 0) < (lp[q[best].user] ?? 0)) best = i;
+      });
+      const [s] = q.splice(best, 1);
+      lp[s.user] = ++t;
+      out.push(s);
+    }
+    return out;
   };
 
   // Last N mono samples of what is playing, for the visualizer.
@@ -130,7 +143,7 @@ async function host() {
   const status = () =>
     [
       (now ? `▶ ${now.title} [${fmt(now.secs)}] — ${now.user}` : "(nothing playing)") + (shuffle ? "  [shuffle]" : ""),
-      ...queue.map((s, i) => `${i + 1}. ${s.title} [${fmt(s.secs)}] — ${s.user}`),
+      ...upcoming().map((s, i) => `${i + 1}. ${s.title} [${fmt(s.secs)}] — ${s.user}`),
     ].join("\n");
 
   http
@@ -148,6 +161,8 @@ async function host() {
           return res.end(`queued: ${song.title} [${fmt(song.secs)}]\n`);
         }
         if (url.pathname === "/queue") return res.end(status() + "\n");
+        if (url.pathname === "/state")
+          return res.end(JSON.stringify({ now: now && { ...now, elapsed: (Date.now() - startedAt) / 1000 }, queue: upcoming(), shuffle }));
         res.writeHead(404).end("not found\n");
       } catch (e) {
         res.writeHead(400).end(`error: ${e.message}\n`);
@@ -194,7 +209,8 @@ async function host() {
   const H = Math.max(qr.length, 14);
 
   // Spectrum: magnitude at log-spaced frequencies (40Hz..16kHz) via single-bin DFT, auto-gain in dB.
-  const bars = new Array(64).fill(0);
+  const bars = new Array(96).fill(0);
+  const hann = Float32Array.from({ length: N }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N));
   let topDb = -20;
   function viz(n, h) {
     let max = -120;
@@ -202,11 +218,14 @@ async function host() {
     for (let b = 0; b < n; b++) {
       const f = 40 * Math.pow(400, b / (n - 1));
       const w = (2 * Math.PI * f) / 44100;
-      let re = 0, im = 0;
+      // Rotate a unit phasor instead of calling cos/sin per sample.
+      const cw = Math.cos(w), sw = Math.sin(w);
+      let re = 0, im = 0, pc = 1, ps = 0;
       for (let i = 0; i < N; i++) {
-        const x = ring[(ringPos + i) % N] * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N));
-        re += x * Math.cos(w * i);
-        im -= x * Math.sin(w * i);
+        const x = ring[(ringPos + i) % N] * hann[i];
+        re += x * pc;
+        im -= x * ps;
+        [pc, ps] = [pc * cw - ps * sw, pc * sw + ps * cw];
       }
       const db = 20 * Math.log10(Math.hypot(re, im) + 1e-9) + 4.5 * Math.log2(f / 40); // tilt so highs show up
       max = Math.max(max, db);
@@ -231,12 +250,16 @@ async function host() {
   function render() {
     const cols = process.stdout.columns || 80;
     const rows = process.stdout.rows || 24;
-    const left =
-      view === "qr"
+    const stacked = layout === "stack" || cols < LW + 30;
+    const center = (l, w) => " ".repeat(Math.max(0, Math.floor((cols - w) / 2))) + l;
+    const left = stacked
+      ? view === "qr"
+        ? [...qr.map((l) => center(l, [...qr[0]].length)), center("scan to add songs", 17)]
+        : viz(Math.min(bars.length, Math.floor(cols / 3)), Math.max(6, Math.floor(rows * 0.45)))
+      : view === "qr"
         ? [...qr, "", "  scan to add songs"]
         : [...viz(Math.floor(LW / 3), H - 2), "", c(245, cut(web, LW))];
-    const narrow = cols < LW + 30;
-    const RW = narrow ? cols : cols - LW - 3;
+    const RW = stacked ? cols : cols - LW - 3;
     const elapsed = now ? (Date.now() - startedAt) / 1000 : 0;
     const pw = Math.max(10, RW - 14);
     const done = now?.secs ? Math.min(pw, Math.round((elapsed / now.secs) * pw)) : 0;
@@ -249,14 +272,14 @@ async function host() {
       now ? c(171, "━".repeat(done)) + c(238, "━".repeat(pw - done)) + ` ${fmt(elapsed)}/${fmt(now.secs)}` : "",
       "",
       bold("Up next"),
-      ...(queue.length ? queue.map((s, i) => cut(`${i + 1}. ${s.title} — ${s.user}`, RW)) : [c(245, fallback.length ? "  (fallback playlist)" : "  (empty)")]),
+      ...(queue.length ? upcoming().map((s, i) => cut(`${i + 1}. ${s.title} — ${s.user}`, RW)) : [c(245, fallback.length ? "  (fallback playlist)" : "  (empty)")]),
       "",
       ...events.map((e) => c(245, cut(e, RW))),
     ];
-    const body = narrow ? [...left, "", ...right] : Array.from({ length: Math.max(left.length, right.length) }, (_, i) => pad(left[i] ?? "", LW) + "   " + (right[i] ?? ""));
+    const body = stacked ? [...left, "", ...right] : Array.from({ length: Math.max(left.length, right.length) }, (_, i) => pad(left[i] ?? "", LW) + "   " + (right[i] ?? ""));
     const lines = body.slice(0, rows - 2);
     while (lines.length < rows - 2) lines.push("");
-    lines.push(c(245, cut("<song> add · s skip · r shuffle · v/tab visualizer · q quit", cols)));
+    lines.push(c(245, cut("<song> add · s skip · r shuffle · v/tab visualizer · t layout · q quit", cols)));
     process.stdout.write("\x1b[H" + lines.map((l) => l + "\x1b[K").join("\r\n") + "\r\n" + cut(`> ${input}`, cols) + "\x1b[K");
   }
 
@@ -266,6 +289,7 @@ async function host() {
     else if (line === "s") player?.kill();
     else if (line === "r") say(`shuffle ${(shuffle = !shuffle) ? "on" : "off"}`);
     else if (line === "v") view = view === "qr" ? "viz" : "qr";
+    else if (line === "t") (layout = layout === "side" ? "stack" : "side"), process.stdout.write("\x1b[2J");
     else if (line)
       search(line)
         .then(([s]) => add("host", s))
@@ -336,7 +360,17 @@ const PAGE = `<!doctype html><meta charset=utf-8><meta name=viewport content="wi
 body{font:16px system-ui;padding:16px;background:#111;color:#eee;max-width:560px;margin:auto}
 input,button{font:inherit;padding:12px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;width:100%;box-sizing:border-box;margin:4px 0}
 button{background:#7c3aed;border:0;font-weight:600;cursor:pointer}
-pre{white-space:pre-wrap;background:#1b1b1b;padding:12px;border-radius:8px}
+.card{display:flex;gap:12px;align-items:center;background:#1b1b1b;border-radius:12px;padding:10px;margin:8px 0}
+.card img{width:96px;aspect-ratio:16/9;object-fit:cover;border-radius:8px;flex:none}
+.card .t{font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.card small{color:#999}
+.card.now{background:linear-gradient(135deg,#3b1d6e,#1b1b1b);border:1px solid #7c3aed}
+.card.now img{width:120px}
+.badge{font-size:12px;color:#c4b5fd;text-transform:uppercase;letter-spacing:.05em}
+.bar{height:4px;background:#333;border-radius:2px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;background:#a78bfa}
+.n{color:#666;font-weight:700;width:1.5em;text-align:center;flex:none}
+.empty{color:#777;padding:8px}
 #msg{min-height:1.4em;color:#a78bfa}
 .r{display:flex;gap:10px;align-items:center;background:#1b1b1b;border-radius:8px;padding:8px;margin:6px 0}
 .r img{width:96px;border-radius:6px}
@@ -352,7 +386,8 @@ pre{white-space:pre-wrap;background:#1b1b1b;padding:12px;border-radius:8px}
 </form>
 <div id=msg></div>
 <div id=results></div>
-<h3>Queue</h3><pre id=list>loading…</pre>
+<div id=now></div>
+<h3>Up next</h3><div id=list><div class=empty>loading…</div></div>
 <script>
 const code = new URLSearchParams(location.search).get("code") || prompt("Room code");
 const $ = (id) => document.getElementById(id);
@@ -360,7 +395,39 @@ const user = $("user"), q = $("q"), msg = $("msg"), results = $("results");
 try { user.value = localStorage.name || "" } catch {}
 const call = (path, extra) => fetch(path + "?" + new URLSearchParams(Object.assign({ code: code, user: user.value }, extra)));
 const fmt = (s) => s ? Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0") : "";
-const refresh = async () => $("list").textContent = await (await call("/queue")).text();
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const card = (s, extra) => {
+  const c = el("div", "card");
+  const img = el("img"); img.src = "https://i.ytimg.com/vi/" + s.id + "/mqdefault.jpg"; img.alt = "";
+  const info = el("div"); info.style.minWidth = "0"; info.style.flex = "1";
+  info.append(el("div", "t", s.title), el("small", "", "added by " + s.user + (s.secs ? " · " + fmt(s.secs) : "")));
+  if (extra) extra(c, info);
+  c.append(img, info);
+  return c;
+};
+let state = null, fetchedAt = 0;
+const drawNow = () => {
+  const box = $("now");
+  if (!state || !state.now) return box.replaceChildren(el("div", "empty", "Nothing playing. Add a song!"));
+  const s = state.now, elapsed = s.elapsed + (Date.now() - fetchedAt) / 1000;
+  box.replaceChildren(card(s, (c, info) => {
+    c.classList.add("now");
+    info.prepend(el("div", "badge", "▶ Now playing" + (state.shuffle ? " · shuffle" : "")));
+    const bar = el("div", "bar"), fill = el("i");
+    fill.style.width = s.secs ? Math.min(100, elapsed / s.secs * 100) + "%" : "0";
+    bar.append(fill); info.append(bar);
+  }));
+};
+const refresh = async () => {
+  const r = await call("/state");
+  if (!r.ok) return $("list").replaceChildren(el("div", "empty", await r.text()));
+  state = await r.json(); fetchedAt = Date.now();
+  drawNow();
+  $("list").replaceChildren(...(state.queue.length
+    ? state.queue.map((s, i) => card(s, (c) => c.prepend(el("div", "n", i + 1))))
+    : [el("div", "empty", "Queue is empty")]));
+};
+setInterval(drawNow, 1000);
 $("f").onsubmit = async (e) => {
   e.preventDefault();
   try { localStorage.name = user.value } catch {}
@@ -383,9 +450,9 @@ $("f").onsubmit = async (e) => {
     info.append(t, d); row.append(img, info, b); results.append(row);
   }
 };
-refresh(); setInterval(refresh, 5000);
+refresh(); setInterval(refresh, 3000);
 </script>`;
 
 if (cmd === "host") host();
 else if (cmd === "join") join();
-else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--fallback <playlist url>]\n  jukebox join <host:port | https://url> <CODE> [name]");
+else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--fallback <playlist url>]\n  jukebox join <host:port | https://url> <CODE> [name]");
