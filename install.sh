@@ -12,6 +12,8 @@ say() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 has() { command -v "$1" >/dev/null 2>&1; }
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+# Download to a temp file and move into place, so an interrupted download never leaves a broken binary.
+fetch() { curl -fL --progress-bar "$1" -o "$2.part" && chmod +x "$2.part" && mv "$2.part" "$2"; }
 
 # 1. System packages, only the missing ones: ffmpeg, qrencode, node (+ yt-dlp, cloudflared on macOS)
 missing=()
@@ -41,23 +43,21 @@ case "$(uname -s)" in
     fi
     # Distro yt-dlp is usually too old for YouTube; use the official binary.
     mkdir -p "$BIN_DIR"
-    if [ -x "$BIN_DIR/yt-dlp" ]; then
+    if "$BIN_DIR/yt-dlp" --version >/dev/null 2>&1; then
       say "Updating yt-dlp"
       "$BIN_DIR/yt-dlp" -U >/dev/null || true
     else
       say "Installing latest yt-dlp to $BIN_DIR"
-      curl -fL --progress-bar https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$BIN_DIR/yt-dlp"
-      chmod +x "$BIN_DIR/yt-dlp"
+      fetch https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp "$BIN_DIR/yt-dlp"
     fi
     # cloudflared powers `jukebox host --tunnel`.
-    if ! has cloudflared; then
+    if ! cloudflared --version >/dev/null 2>&1; then
       case "$(uname -m)" in
         x86_64) CF_ARCH=amd64 ;; aarch64|arm64) CF_ARCH=arm64 ;; armv7l|armv6l) CF_ARCH=arm ;; *) CF_ARCH="" ;;
       esac
       if [ -n "$CF_ARCH" ]; then
         say "Installing cloudflared to $BIN_DIR"
-        curl -fL --progress-bar "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH" -o "$BIN_DIR/cloudflared"
-        chmod +x "$BIN_DIR/cloudflared"
+        fetch "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH" "$BIN_DIR/cloudflared"
       else
         say "Skipping cloudflared (unknown CPU $(uname -m)); --tunnel will not work"
       fi
@@ -77,7 +77,7 @@ if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/jukebox.mjs" ]; then
   cp "$SRC_DIR/jukebox.mjs" "$APP_DIR/jukebox.mjs"
 else
   say "Downloading jukebox.mjs"
-  curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/jukebox.mjs" -o "$APP_DIR/jukebox.mjs"
+  fetch "https://raw.githubusercontent.com/$REPO/$BRANCH/jukebox.mjs" "$APP_DIR/jukebox.mjs"
 fi
 chmod +x "$APP_DIR/jukebox.mjs"
 ln -sf "$APP_DIR/jukebox.mjs" "$BIN_DIR/jukebox"
