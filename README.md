@@ -38,6 +38,7 @@ jukebox host --limit 3 --shuffle --fallback "https://www.youtube.com/playlist?li
 | `--tunnel` | off | Public HTTPS link via a free Cloudflare quick tunnel (no account), so guests on any network can join |
 | `--stacked` | off | Start in the top/bottom layout (visualizer or QR on top, queue below) |
 | `--fallback` | none | Playlist that plays when the queue is empty |
+| `--cookies` | none | Browser to borrow YouTube cookies from (`chrome`, `firefox`, `safari`, `brave`...). Fixes "Sign in to confirm you're not a bot" |
 
 While hosting, type at the `>` prompt:
 

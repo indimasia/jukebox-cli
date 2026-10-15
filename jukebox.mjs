@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Jukebox CLI: shared music queue, terminal only, audio only.
-// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--fallback <youtube playlist url>]
+// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--cookies <browser>] [--fallback <youtube playlist url>]
 // Guests scan the QR (web page) or use: jukebox join <host:port> <CODE> <name>
 import http from "node:http";
 import os from "node:os";
@@ -16,9 +16,11 @@ const flag = (name, def) => {
 const AUDIO_OUT = process.platform === "darwin" ? ["-f", "audiotoolbox", "-"] : ["-f", "alsa", "default"];
 const fmt = (s) => (s ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}` : "?:??");
 
+// YouTube "Sign in to confirm you're not a bot": borrow a logged-in browser's cookies.
+const COOKIES = flag("cookies") ? ["--cookies-from-browser", flag("cookies")] : [];
 const ytdlp = (args) =>
   new Promise((res, rej) =>
-    execFile("yt-dlp", args, { maxBuffer: 1 << 24 }, (err, out, errOut) =>
+    execFile("yt-dlp", [...COOKIES, ...args], { maxBuffer: 1 << 24 }, (err, out, errOut) =>
       err ? rej(new Error(errOut.trim().split("\n").pop() || err.message)) : res(out.trim()),
     ),
   );
@@ -134,7 +136,7 @@ async function host() {
   let song = null; // { chunks, done, dl, sink }
   function download(s) {
     song?.dl.kill();
-    const dl = spawn("yt-dlp", ["-q", "-f", "bestaudio", "-o", "-", "--", `https://youtu.be/${s.id}`], { stdio: ["ignore", "pipe", "ignore"] });
+    const dl = spawn("yt-dlp", [...COOKIES, "-q", "-f", "bestaudio", "-o", "-", "--", `https://youtu.be/${s.id}`], { stdio: ["ignore", "pipe", "ignore"] });
     const cur = (song = { chunks: [], done: false, dl, sink: null });
     dl.stdout.on("data", (b) => (cur.chunks.push(b), cur.sink?.write(b)));
     dl.stdout.on("end", () => ((cur.done = true), cur.sink?.end()));
@@ -501,4 +503,4 @@ refresh(); setInterval(refresh, 3000);
 
 if (cmd === "host") host();
 else if (cmd === "join") join();
-else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--fallback <playlist url>]\n  jukebox join <host:port | https://url> <CODE> [name]");
+else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--cookies <browser>] [--fallback <playlist url>]\n  jukebox join <host:port | https://url> <CODE> [name]");
