@@ -30,6 +30,15 @@ jukebox host --tunnel      # guests can join from anywhere, not just your Wi-Fi
 jukebox host --limit 3 --shuffle --fallback "https://www.youtube.com/playlist?list=..."
 ```
 
+Refresh YouTube cookies when playback starts failing ("Sign in to confirm you're not a bot"):
+
+```bash
+jukebox doctor            # checks tools, cookies, download, audio — prints ok/FAIL with fixes
+jukebox cookies           # dump this machine's browser cookies (auto-detects browser)
+jukebox cookies firefox   # or name the browser explicitly
+jukebox host --cookies ~/.config/jukebox/cookies.txt
+```
+
 | Option | Default | What it does |
 |---|---|---|
 | `--port` | `7777` | Web/API port |
@@ -38,7 +47,7 @@ jukebox host --limit 3 --shuffle --fallback "https://www.youtube.com/playlist?li
 | `--tunnel` | off | Public HTTPS link via a free Cloudflare quick tunnel (no account), so guests on any network can join |
 | `--stacked` | off | Start in the top/bottom layout (visualizer or QR on top, queue below) |
 | `--fallback` | none | Playlist that plays when the queue is empty |
-| `--cookies` | none | Browser to borrow YouTube cookies from (`chrome`, `firefox`, `safari`, `brave`...). Fixes "Sign in to confirm you're not a bot" |
+| `--cookies` | none | Browser to borrow YouTube cookies from (`chrome`, `firefox`, `safari`, `brave`...), or a `cookies.txt` file. Fixes "Sign in to confirm you're not a bot". Over SSH the host can't see your laptop's browser, so export locally (`yt-dlp --cookies-from-browser chrome --cookies cookies.txt -- "URL"`), `scp` it to the host, and use `--cookies ~/cookies.txt` |
 
 While hosting, type at the `>` prompt:
 

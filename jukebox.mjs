@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Jukebox CLI: shared music queue, terminal only, audio only.
-// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--cookies <browser>] [--fallback <youtube playlist url>]
+// Host:  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--cookies <browser|cookies.txt>] [--fallback <youtube playlist url>]
 // Guests scan the QR (web page) or use: jukebox join <host:port> <CODE> <name>
 import http from "node:http";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
 import { spawn, execFile, execFileSync } from "node:child_process";
 
@@ -16,13 +18,30 @@ const flag = (name, def) => {
 const AUDIO_OUT = process.platform === "darwin" ? ["-f", "audiotoolbox", "-"] : ["-f", "alsa", "default"];
 const fmt = (s) => (s ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}` : "?:??");
 
-// YouTube "Sign in to confirm you're not a bot": borrow a logged-in browser's cookies.
-const COOKIES = flag("cookies") ? ["--cookies-from-browser", flag("cookies")] : [];
+// YouTube "Sign in to confirm you're not a bot".
+// --cookies <browser> (chrome, firefox, safari...) reads that browser on THIS machine.
+// Over SSH the browser isn't there, so export a cookies.txt locally and copy it over:
+//   yt-dlp --cookies-from-browser chrome --cookies cookies.txt -- "https://youtu.be/dQw4w9WgXcQ"
+//   scp cookies.txt user@jukebox-host:~/
+// then: jukebox host --cookies ~/cookies.txt
+const BROWSERS = new Set(["brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"]);
+const cookieFlag = flag("cookies");
+const looksLikeFile = cookieFlag && (cookieFlag.includes("/") || /\.(txt|cookies?)$/i.test(cookieFlag) || (!BROWSERS.has(cookieFlag.split(":")[0].toLowerCase()) && fs.existsSync(cookieFlag)));
+const COOKIE_PATH = looksLikeFile ? cookieFlag.replace(/^~(?=\/|$)/, os.homedir()) : null;
+if (cookieFlag && looksLikeFile && !fs.existsSync(COOKIE_PATH)) {
+  console.error(`--cookies file not found: ${COOKIE_PATH}`);
+  process.exit(1);
+}
+const COOKIES = !cookieFlag ? [] : COOKIE_PATH ? ["--cookies", COOKIE_PATH] : ["--cookies-from-browser", cookieFlag];
+const YT_HINT = " (YouTube bot-check? host needs --cookies: export cookies.txt locally, scp it to the host, run --cookies ~/cookies.txt)";
 const ytdlp = (args) =>
   new Promise((res, rej) =>
-    execFile("yt-dlp", [...COOKIES, ...args], { maxBuffer: 1 << 24 }, (err, out, errOut) =>
-      err ? rej(new Error(errOut.trim().split("\n").pop() || err.message)) : res(out.trim()),
-    ),
+    execFile("yt-dlp", [...COOKIES, ...args], { maxBuffer: 1 << 24 }, (err, out, errOut) => {
+      if (err) {
+        const last = errOut.trim().split("\n").pop() || err.message;
+        rej(new Error(/sign in|bot|cookie|403|401|login/i.test(last) ? last + YT_HINT : last));
+      } else res(out.trim());
+    }),
   );
 
 const known = new Map(); // ponytail: id -> song from searches, never pruned; fine for one party
@@ -60,7 +79,11 @@ async function host() {
   const queue = []; // {id,title,secs,user}
   const lastPlayed = {}; // user -> timestamp, for round-robin fairness
   const events = [];
-  const say = (m) => events.push(m) > 6 && events.shift();
+  const HEADLESS = !process.stdout.isTTY;
+  const say = (m) => {
+    events.push(m) > 6 && events.shift();
+    if (HEADLESS) console.log(m);
+  };
   let shuffle = rest.includes("--shuffle");
   let view = "qr"; // or "viz"
   let layout = rest.includes("--stacked") ? "stack" : "side"; // side-by-side or top/bottom
@@ -72,6 +95,8 @@ async function host() {
   let pausedAt = null; // seconds into the song while paused, else null
 
   if (flag("fallback")) fallback = parse(await ytdlp(["--flat-playlist", "--print", "%(id)s\t%(title)s\t%(duration)s", "--", flag("fallback")]), "fallback");
+  if (cookieFlag && !COOKIE_PATH && (process.env.SSH_CONNECTION || process.env.SSH_CLIENT))
+    say("! SSH session: --cookies <browser> can't see your laptop's browser, use --cookies ~/cookies.txt");
 
   const add = (user, song) => {
     if (queue.filter((s) => s.user === user).length >= limit) throw new Error(`limit of ${limit} queued songs reached`);
@@ -134,13 +159,30 @@ async function host() {
   // The current song's audio is kept in memory as it downloads, so pause/resume never hits YouTube again.
   // ponytail: whole song in RAM (~4-10MB per song), only the current one.
   let song = null; // { chunks, done, dl, sink }
-  function download(s) {
-    song?.dl.kill();
-    const dl = spawn("yt-dlp", [...COOKIES, "-q", "-f", "bestaudio", "-o", "-", "--", `https://youtu.be/${s.id}`], { stdio: ["ignore", "pipe", "ignore"] });
-    const cur = (song = { chunks: [], done: false, dl, sink: null });
+  function download(s, attempt = 0, cur) {
+    // retries reuse `cur` so the running decoder stays wired to the new yt-dlp
+    if (!cur) (song?.dl?.kill(), (cur = song = { chunks: [], done: false, dl: null, sink: null }));
+    // bestaudio (opus 251) 403s on some videos without a GVS PO token;
+    // walk down: m4a 140, legacy progressive mp4 18 (audio in video file),
+    // then anything. 18 has worked even with no cookies at all.
+    const formats = ["bestaudio", "140/best[acodec^=mp4a]/bestaudio", "18/best[ext=mp4]/best"];
+    const fmt = formats[Math.min(attempt, formats.length - 1)];
+    const dl = spawn("yt-dlp", [...COOKIES, "--no-progress", "-f", fmt, "-o", "-", "--", `https://youtu.be/${s.id}`], { stdio: ["ignore", "pipe", "pipe"] });
+    cur.dl = dl;
+    let errOut = "";
+    dl.stderr.on("data", (b) => (errOut += b));
     dl.stdout.on("data", (b) => (cur.chunks.push(b), cur.sink?.write(b)));
-    dl.stdout.on("end", () => ((cur.done = true), cur.sink?.end()));
-    dl.on("exit", (code) => code && !cur.chunks.length && say(`! YouTube refused "${s.title}", skipped`));
+    dl.on("close", (code) => {
+      if (song !== cur) return;
+      if (code && !cur.chunks.length) {
+        if (attempt + 1 < formats.length) return download(s, attempt + 1, cur);
+        const last = errOut.trim().split("\n").pop() || "YouTube refused the download";
+        say(`! "${s.title}" skipped: ${/sign in|bot|cookie|403|401|login/i.test(last) ? last + YT_HINT : last}`.slice(0, 200));
+      }
+      // empty input makes the decoder exit, which advances the queue
+      cur.done = true;
+      cur.sink?.end();
+    });
   }
 
   // Pause stops playback and remembers the position; play restarts decoding from memory at that spot (ffmpeg -ss).
@@ -345,24 +387,36 @@ async function host() {
 
   process.stdout.write("\x1b[?1049h\x1b[2J");
   process.on("exit", () => process.stdout.write("\x1b[?1049l"));
-  process.stdout.on("resize", () => process.stdout.write("\x1b[2J"));
-  if (process.stdin.isTTY) {
-    readline.emitKeypressEvents(process.stdin);
-    process.stdin.setRawMode(true);
-    process.stdin.on("keypress", (ch, key) => {
-      if (key?.ctrl && key.name === "c") quit();
-      else if (key?.name === "return") (command(input.trim()), (input = ""));
-      else if (key?.name === "backspace") input = input.slice(0, -1);
-      else if (key?.name === "tab") view = view === "qr" ? "viz" : "qr";
-      else if (key?.name === "space" && !input) command("p");
-      else if (ch && !key?.ctrl && !key?.meta && ch >= " ") input += ch;
+  if (!HEADLESS) {
+    process.stdout.on("resize", () => process.stdout.write("\x1b[2J"));
+    if (process.stdin.isTTY) {
+      readline.emitKeypressEvents(process.stdin);
+      process.stdin.setRawMode(true);
+      process.stdin.on("keypress", (ch, key) => {
+        if (key?.ctrl && key.name === "c") quit();
+        else if (key?.name === "return") (command(input.trim()), (input = ""));
+        else if (key?.name === "backspace") input = input.slice(0, -1);
+        else if (key?.name === "tab") view = view === "qr" ? "viz" : "qr";
+        else if (key?.name === "space" && !input) command("p");
+        else if (ch && !key?.ctrl && !key?.meta && ch >= " ") input += ch;
+        render();
+      });
+    } else if (!process.stdin.destroyed) {
+      readline
+        .createInterface({ input: process.stdin })
+        .on("line", (l) => command(l.trim()))
+        .on("error", () => {});
+      process.stdin.on("error", () => {});
+    }
+    (function loop() {
       render();
-    });
-  } else readline.createInterface({ input: process.stdin }).on("line", (l) => command(l.trim()));
-  (function loop() {
-    render();
-    setTimeout(loop, view === "viz" ? 50 : 500);
-  })();
+      setTimeout(loop, view === "viz" ? 50 : 500);
+    })();
+  } else {
+    process.stdout.write("\x1b[?1049l");
+    console.log(`jukebox up: room ${code} on port ${port}`);
+    if (web) console.log(`join: ${web}`);
+  }
 }
 
 async function join() {
@@ -503,4 +557,109 @@ refresh(); setInterval(refresh, 3000);
 
 if (cmd === "host") host();
 else if (cmd === "join") join();
-else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--cookies <browser>] [--fallback <playlist url>]\n  jukebox join <host:port | https://url> <CODE> [name]");
+else if (cmd === "cookies") cookies();
+else if (cmd === "doctor") doctor();
+else console.log("usage:\n  jukebox host [--port 7777] [--limit 2] [--shuffle] [--tunnel] [--stacked] [--cookies <browser|cookies.txt>] [--fallback <playlist url>]\n  jukebox cookies [<browser>] [--out <cookies.txt>]\n  jukebox doctor [--cookies <browser|cookies.txt>]\n  jukebox join <host:port | https://url> <CODE> [name]");
+
+// Dump this machine's browser cookies to a Netscape cookies.txt file.
+// Run it ON the machine with the GUI browser (the jukebox host itself, or
+// your laptop then scp the file over). Uses yt-dlp --cookies-from-browser,
+// then verifies the file with a quick YouTube lookup.
+function cookies() {
+  const dir = path.join(os.homedir(), ".config", "jukebox");
+  const want = rest.find((a) => !a.startsWith("--") && a !== "cookies");
+  const out = flag("out", want?.includes("/") || want?.endsWith(".txt") ? want : path.join(dir, "cookies.txt"));
+  const browser = want && !want.includes("/") && !want.endsWith(".txt") ? want : detectBrowser();
+  if (!browser) {
+    console.error("no supported browser profile found (looked for chrome, chromium, firefox, brave, edge, opera, vivaldi).\nLog into YouTube in a browser on this machine first, or pass one explicitly: jukebox cookies firefox");
+    process.exit(1);
+  }
+  console.log(`reading cookies from ${browser}...`);
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  try {
+    execFileSync("yt-dlp", ["--cookies-from-browser", browser, "--cookies", out, "--skip-download", "--print", "title", "--", "https://youtu.be/dQw4w9WgXcQ"], { stdio: "pipe" });
+  } catch (e) {
+    console.error(`failed to read ${browser} cookies. Is the browser running? (quit it and retry)\n${String(e.stderr ?? e.message).trim().split("\n").pop()}`);
+    process.exit(1);
+  }
+  const yt = Number(execFileSync("grep", ["-c", "youtube", out]).toString().trim());
+  console.log(`wrote ${out} (${yt} YouTube cookies) — use: jukebox host --cookies ${out}`);
+}
+
+function detectBrowser() {
+  const home = os.homedir();
+  const has = (p) => fs.existsSync(path.join(home, p));
+  for (const [name, dir] of [
+    ["chrome", ".config/google-chrome"],
+    ["chromium", ".config/chromium"],
+    ["brave", ".config/BraveSoftware/Brave-Browser"],
+    ["firefox", ".mozilla/firefox"],
+    ["firefox", ".config/mozilla/firefox"],
+    ["firefox", "Library/Application Support/Firefox"],
+    ["edge", ".config/microsoft-edge"],
+    ["opera", ".config/opera"],
+    ["vivaldi", ".config/vivaldi"],
+    ["safari", "Library/Cookies"],
+  ])
+    if (has(dir)) return name;
+  return null;
+}
+
+// Diagnose why songs won't play. Each check prints ok or FAIL with the fix.
+// Run: jukebox doctor [--cookies <browser|cookies.txt>]
+async function doctor() {
+  let failed = 0;
+  const ok = (name) => console.log(`ok   ${name}`);
+  const fail = (name, fix) => (failed++, console.log(`FAIL ${name}\n     fix: ${fix}`));
+  const run = (bin, args) => {
+    try {
+      return { out: execFileSync(bin, args, { stdio: "pipe" }).toString().trim() };
+    } catch (e) {
+      const text = String(e.stderr ?? e.message).replace(/\r[^\n]*/g, "").trim();
+      return { err: text.split("\n").filter(Boolean).pop() };
+    }
+  };
+
+  // 1. required tools
+  const tools = { "yt-dlp": "--version", ffmpeg: "-version", node: "--version" };
+  for (const [bin, v] of Object.entries(tools)) {
+    const r = run(bin, [v]);
+    r.err ? fail(`${bin} missing (${r.err})`, `install ${bin}, then re-run install.sh`) : ok(`${bin} ${r.out.split("\n")[0].slice(0, 40)}`);
+  }
+
+  // 2. resolve --cookies the same way host does
+  const cf = flag("cookies") ?? path.join(os.homedir(), ".config", "jukebox", "cookies.txt");
+  const isFile = cf.includes("/") || /\.(txt|cookies?)$/i.test(cf) || fs.existsSync(cf);
+  const ytArgs = isFile ? ["--cookies", cf.replace(/^~(?=\/|$)/, os.homedir())] : ["--cookies-from-browser", cf];
+  if (isFile && !fs.existsSync(cf.replace(/^~(?=\/|$)/, os.homedir())))
+    fail(`cookies file missing: ${cf}`, `run: jukebox cookies   (then: jukebox host --cookies ${cf})`);
+  else {
+    const yt = Number(run("grep", ["-c", "youtube", cf.replace(/^~(?=\/|$)/, os.homedir())]).out ?? 0);
+    yt > 0 ? ok(`${yt} YouTube cookies in ${cf}`) : fail(`no YouTube cookies in ${cf}`, `run: jukebox cookies`);
+  }
+
+  // 3. metadata lookup (search path)
+  const meta = run("yt-dlp", [...ytArgs, "--no-playlist", "--skip-download", "--print", "%(title)s", "--", "https://youtu.be/dQw4w9WgXcQ"]);
+  meta.err ? fail(`metadata lookup: ${meta.err}`, `run: jukebox cookies   then retry`) : ok(`metadata: ${meta.out.slice(0, 50)}`);
+
+  // 4. bestaudio download = what jukebox plays (fallback to 18 like host does)
+  const dl = (f) => {
+    const tmp = path.join(os.tmpdir(), `jukebox-doctor.${Date.now()}.${f}`);
+    const r = run("yt-dlp", [...ytArgs, "-f", f, "--no-playlist", "-o", tmp, "--", "https://youtu.be/dQw4w9WgXcQ"]);
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
+    return r;
+  };
+  const a = dl("bestaudio");
+  if (!a.err) ok("bestaudio download works");
+  else if (/403|forbidden/i.test(a.err) && !dl("18").err) ok("bestaudio 403s but format 18 works (host auto-falls-back)");
+  else fail(`audio download: ${a.err?.slice(0, 100)}`, `run: jukebox cookies   then retry`);
+
+  // 5. audio output device (host plays through ffmpeg -> speakers)
+  const sink = run("sh", ["-c", process.platform === "darwin" ? "system_profiler SPAudioDataType 2>/dev/null | grep -m1 'Output' || echo speaker" : "aplay -l 2>/dev/null | grep -m1 card || pactl get-default-sink 2>/dev/null || echo no-sink"]);
+  /no-sink|not found|no such/i.test(sink.err ?? sink.out ?? "") ? fail("no audio output device", "plug in speakers or check PipeWire/ALSA") : ok(`audio device: ${(sink.out ?? "").slice(0, 50)}`);
+
+  console.log(failed ? `\n${failed} check(s) FAILED — apply the fix lines above, then re-run: jukebox doctor` : "\nall checks passed — playback should work");
+  process.exit(failed ? 1 : 0);
+}
